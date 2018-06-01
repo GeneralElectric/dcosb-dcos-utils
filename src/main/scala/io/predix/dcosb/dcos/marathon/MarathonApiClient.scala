@@ -23,6 +23,7 @@ object MarathonApiClient {
 
   // handled messages
   case class GetApp(id: String)
+  case class GetAppIds(idContains: String)
 
   // responses
   case class AppNotFound(id: String) extends Throwable
@@ -34,12 +35,14 @@ object MarathonApiClient {
                    env: Map[String, String],
                    labels: Map[String, String])
     case class AppDescriptorResponse(app: App)
+    case class AppsResponse(apps: Seq[App])
 
     trait JsonSupport extends DefaultJsonProtocol with SprayJsonSupport {
 
       implicit val appFormat = jsonFormat3(App)
       implicit val appDescriptorResponseFormat = jsonFormat1(
         AppDescriptorResponse)
+      implicit val appsResponseFormat = jsonFormat1(AppsResponse)
 
     }
   }
@@ -67,6 +70,7 @@ class MarathonApiClient
   override def configuredBehavior = {
 
     case GetApp(id: String) => broadcastFuture(getApp(id), sender())
+    case GetAppIds(idContains: String) => broadcastFuture(getAppIds(idContains), sender())
 
   }
 
@@ -83,20 +87,58 @@ class MarathonApiClient
             case Success(app: APIModel.AppDescriptorResponse) =>
               promise.success(app.app)
             case Failure(e: Throwable) =>
+              appDescriptorResponseEntity.discardBytes(mat)
               log.error(s"Failed to unmarshal app response from marathon: $e")
           }
 
-        case Success(HttpResponse(StatusCodes.NotFound, _, _, _)) =>
+        case Success(HttpResponse(StatusCodes.NotFound, _, re, _)) =>
+          re.discardBytes(mat)
           promise.failure(AppNotFound(id))
 
         case Success(r: HttpResponse) =>
           log.error(
             s"Unexpected HTTP response while trying to get app with id $id: $r")
+          r.entity.discardBytes(mat)
           promise.failure(UnexpectedResponse(r))
 
         case Failure(e: Throwable) =>
           log.error(
             s"Failed to send request to Marathon to retrieve app with id $id, exception was: $e")
+          promise.failure(e)
+      }
+    )
+
+    promise.future
+
+  }
+
+  def getAppIds(idContains: String): Future[Seq[String]] = {
+
+    val promise = Promise[Seq[String]]()
+    val getAppsRequest =
+      HttpRequest(method = HttpMethods.GET, uri = s"/service/marathon/v2/apps/?id=$idContains")
+
+    `sendRequest and handle response`(
+      getAppsRequest, {
+        case Success(HttpResponse(StatusCodes.OK, _, appsResponseEntity, _)) =>
+          Unmarshal(appsResponseEntity).to[APIModel.AppsResponse] onComplete {
+            case Success(app: APIModel.AppsResponse) =>
+              promise.success(app.apps map { _.id })
+            case Failure(e: Throwable) =>
+              appsResponseEntity.discardBytes(mat)
+              log.error(s"Failed to unmarshal apps response from marathon: $e")
+          }
+
+
+        case Success(r: HttpResponse) =>
+          log.error(
+            s"Unexpected HTTP response while trying to get apps with id substring $idContains: $r")
+          r.entity.discardBytes(mat)
+          promise.failure(UnexpectedResponse(r))
+
+        case Failure(e: Throwable) =>
+          log.error(
+            s"Failed to send request to Marathon to retrieve apps with id substring $idContains, exception was: $e")
           promise.failure(e)
       }
     )

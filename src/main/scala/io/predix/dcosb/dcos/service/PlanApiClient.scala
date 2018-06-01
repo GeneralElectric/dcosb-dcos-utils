@@ -14,7 +14,7 @@ import scala.util.Success
 
 object PlanApiClient {
 
-  case class Configuration(httpClient: DCOSProxy.HttpClient)
+  case class Configuration(httpClient: DCOSProxy.HttpClient, planApiCompatible: Boolean = true)
 
   // handled messages
   case class RetrievePlan(serviceId: String, planName: String)
@@ -33,6 +33,7 @@ object PlanApiClient {
   class SchedulerGone extends Throwable
   class ServiceNotFound extends Throwable
   case class PlanNotFound(serviceId: String, planName: String) extends Throwable
+  case class NotPlanApiCompatibleService() extends Throwable
 
   object ApiModel {
 
@@ -62,8 +63,11 @@ class PlanApiClient extends ConfiguredActor[PlanApiClient.Configuration] with Ht
   implicit val ec = context.dispatcher
   implicit val mat = ActorMaterializer(ActorMaterializerSettings(context.system))
 
+  private var planApiCompatible = true
+
   override def configure(configuration: Configuration): Future[ConfiguredActor.Configured] = {
     this.httpClient = Some(configuration.httpClient)
+    this.planApiCompatible = configuration.planApiCompatible
 
     super.configure(configuration)
   }
@@ -76,41 +80,56 @@ class PlanApiClient extends ConfiguredActor[PlanApiClient.Configuration] with Ht
   def retrievePlan(serviceId: String, planName: String): Future[ApiModel.Plan] = {
 
     val promise = Promise[ApiModel.Plan]()
-    val listPlans = HttpRequest(method = HttpMethods.GET, uri = s"/service/$serviceId/v1/plans")
 
-    `sendRequest and handle response`(listPlans, {
-      case Success(HttpResponse(StatusCodes.OK, _, plansEntity, _)) =>
-        Unmarshal(plansEntity).to[Array[String]] onComplete {
-          case Success(plans: Array[String]) if plans.contains(planName) =>
-            log.debug(s"Plan $planName found in /plans output")
-            // plan was found, let's get it..
-            val getPlan = HttpRequest(method = HttpMethods.GET, uri = s"/service/$serviceId/v1/plans/$planName")
-            `sendRequest and handle response`(getPlan, {
-              case Success(HttpResponse(status, _, planEntity, _)) if status == StatusCodes.OK || status == StatusCodes.Accepted =>
-                Unmarshal(planEntity).to[ApiModel.Plan] onComplete {
-                  case Success(plan: ApiModel.Plan) =>
-                    promise.success(plan)
-                }
-              case Success(r: HttpResponse) if r.status == StatusCodes.NotFound =>
-                log.warning(s"Plan $planName exists in /plans output but 404 via /plans/$planName ??")
-                promise.failure(new UnexpectedResponse(r))
-              case Success(r: HttpResponse) =>
-                promise.failure(new UnexpectedResponse(r))
-            })
+    planApiCompatible match {
+      case false =>
 
-          case Success(plans: Array[String]) =>
-            promise.failure(new PlanNotFound(serviceId, planName))
-        }
+        promise.failure(NotPlanApiCompatibleService())
 
-      case Success(HttpResponse(StatusCodes.NotFound, _, _, _)) =>
-        promise.failure(new ServiceNotFound())
+      case true =>
 
-      case Success(HttpResponse(StatusCodes.BadGateway, _, _, _)) =>
-        promise.failure(new SchedulerGone())
+        val listPlans = HttpRequest(method = HttpMethods.GET, uri = s"/service/$serviceId/v1/plans")
 
-      case Success(r: HttpResponse) =>
-        promise.failure(new UnexpectedResponse(r))
-    })
+        `sendRequest and handle response`(listPlans, {
+          case Success(HttpResponse(StatusCodes.OK, _, plansEntity, _)) =>
+            Unmarshal(plansEntity).to[Array[String]] onComplete {
+              case Success(plans: Array[String]) if plans.contains(planName) =>
+                log.debug(s"Plan $planName found in /plans output")
+                // plan was found, let's get it..
+                val getPlan = HttpRequest(method = HttpMethods.GET, uri = s"/service/$serviceId/v1/plans/$planName")
+                `sendRequest and handle response`(getPlan, {
+                  case Success(HttpResponse(status, _, planEntity, _)) if status == StatusCodes.OK || status == StatusCodes.Accepted =>
+                    Unmarshal(planEntity).to[ApiModel.Plan] onComplete {
+                      case Success(plan: ApiModel.Plan) =>
+                        promise.success(plan)
+                    }
+                  case Success(r: HttpResponse) if r.status == StatusCodes.NotFound =>
+                    log.warning(s"Plan $planName exists in /plans output but 404 via /plans/$planName ??")
+                    promise.failure(new UnexpectedResponse(r))
+                  case Success(r: HttpResponse) =>
+                    promise.failure(new UnexpectedResponse(r))
+                })
+
+              case Success(plans: Array[String]) =>
+                plansEntity.discardBytes(mat)
+                promise.failure(new PlanNotFound(serviceId, planName))
+            }
+
+          case Success(HttpResponse(StatusCodes.NotFound, _, re, _)) =>
+            re.discardBytes(mat)
+            promise.failure(new ServiceNotFound())
+
+          case Success(HttpResponse(StatusCodes.BadGateway, _, re, _)) =>
+            re.discardBytes(mat)
+            promise.failure(new SchedulerGone())
+
+          case Success(r: HttpResponse) =>
+            r.entity.discardBytes(mat)
+            promise.failure(new UnexpectedResponse(r))
+        })
+
+
+    }
 
     promise.future
 

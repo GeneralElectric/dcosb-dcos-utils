@@ -73,148 +73,180 @@ class PlanApiClientTest extends ActorSuite {
     system.dispatchers.lookup(CallingThreadDispatcher.Id)
   implicit val timeout = Timeout(FiniteDuration(5, TimeUnit.SECONDS))
 
-  "A configured PlanApiClient" - {
+  "A PlanApiClient configured" - {
 
-    trait ConfiguredPlanApiClient {
-      val httpClient =
-        mockFunction[HttpRequest, String, Future[(HttpResponse, String)]]
-      val planApiClient = TestActorRef(
-        Props(classOf[PlanApiClient])
-          .withDispatcher(CallingThreadDispatcher.Id))
+    "for a plan api incompatible service" - {
 
-      Await.result(planApiClient ? PlanApiClient.Configuration(httpClient),
-                   timeout.duration)
+      trait PlanApiIncompatibleConfiguredPlanApiClient {
+        val httpClient =
+          mockFunction[HttpRequest, String, Future[(HttpResponse, String)]]
+        val planApiClient = TestActorRef(
+          Props(classOf[PlanApiClient])
+            .withDispatcher(CallingThreadDispatcher.Id))
 
-    }
-
-    trait PlansResponse
-        extends DefaultJsonProtocol
-        with ConfiguredPlanApiClient {
-      import spray.json._
-
-      def plans = Array[String]("deploy")
-
-      val listPlansRequest = HttpRequest(method = HttpMethods.GET,
-                                         uri = "/service/andras-4/v1/plans")
-
-      httpClient expects (listPlansRequest, *) returning (Future.successful(
-        (HttpResponse(entity =
-           HttpEntity(ContentTypes.`application/json`, plans.toJson.toString)),
-         "")))
-
-    }
-
-    "on receiving a RetrievePlan message" - {
-
-      "for a compliant service api endpoint with a valid plan name" - {
-
-        val retrievePlan = PlanApiClient.RetrievePlan("andras-4", "deploy")
-
-        "it responds with Success(Plan)" in new PlansResponse with JsonSupport
-        with SprayJsonSupport {
-
-          val planResponse = Plan(
-            status = "COMPLETE",
-            errors = List(),
-            phases = List(
-              Phase(
-                id = "ec3c6469-9c40-4e2b-8bc0-593c8c10c708",
-                name = "node-deploy",
-                status = "COMPLETE",
-                steps = List(Step(
-                  id = "55ec5998-fb3d-4930-9b11-52ea69abaa53",
-                  name = "node-0:[server]",
-                  status = "COMPLETE",
-                  message = "com.mesosphere.sdk.scheduler.plan.DeploymentStep: 'node-0:[server] [55ec5998-fb3d-4930-9b11-52ea69abaa53]' has status: 'COMPLETE'."
-                ))
-              ))
-          )
-
-          Await.result(Marshal(planResponse).to[ResponseEntity],
-                       timeout.duration) match {
-            case re: ResponseEntity =>
-              val retrievePlanRequest =
-                HttpRequest(method = HttpMethods.GET,
-                            uri = "/service/andras-4/v1/plans/deploy")
-              httpClient expects (retrievePlanRequest, *) returning (Future
-                .successful((HttpResponse(entity = re), "")))
-
-              Await.result(planApiClient ? retrievePlan, timeout.duration) shouldEqual Success(
-                planResponse)
-
-          }
-
-        }
+        Await.result(planApiClient ? PlanApiClient.Configuration(httpClient, false),
+          timeout.duration)
 
       }
 
-      "for a non-existant plan" - {
+      "on receiving a RetrievePlan message" - {
 
-        val retrievePlan = PlanApiClient.RetrievePlan("andras-4", "party")
-
-        "it responds with Failure(PlanNotFound)" in new PlansResponse
-        with JsonSupport with SprayJsonSupport {
+        "it responds with Failure(NotPlanApiCompatibleService)" in new PlanApiIncompatibleConfiguredPlanApiClient {
+          import PlanApiClient._
+          val retrievePlan = PlanApiClient.RetrievePlan("andras-4", "deploy")
 
           Await.result(planApiClient ? retrievePlan, timeout.duration) shouldEqual Failure(
-            new PlanNotFound("andras-4", "party"))
+            new NotPlanApiCompatibleService)
 
         }
 
       }
-
-      "for a non-compliant service api" - {
-
-        val retrievePlan = PlanApiClient.RetrievePlan("andras-4", "deploy")
-
-        "in that plans can't be listed" - {
-
-          trait InvalidPlansResponse extends ConfiguredPlanApiClient {
-
-            val listPlansRequest = HttpRequest(method = HttpMethods.GET,
-                                               uri =
-                                                 "/service/andras-4/v1/plans")
-
-            httpClient expects (listPlansRequest, *) returning (Future
-              .successful(
-                (HttpResponse(status = StatusCodes.InternalServerError)),
-                ""))
-
-          }
-
-          "it responds with Failure(UnexpectedResponse)" in new InvalidPlansResponse {
-
-            Await.result(planApiClient ? retrievePlan, timeout.duration) shouldEqual Failure(
-              new UnexpectedResponse(
-                HttpResponse(status = StatusCodes.InternalServerError)))
-
-          }
-
-        }
-
-        "in that plan details can't be retrieved" - {
-
-          "it responds with Failure(UnexpectedResponse)" in new PlansResponse {
-
-            val retrievePlanRequest =
-              HttpRequest(method = HttpMethods.GET,
-                uri = "/service/andras-4/v1/plans/deploy")
-            httpClient expects (retrievePlanRequest, *) returning (Future
-              .successful((HttpResponse(status = StatusCodes.InternalServerError), "")))
-
-            Await.result(planApiClient ? retrievePlan, timeout.duration) shouldEqual Failure(
-              new UnexpectedResponse(
-                HttpResponse(status = StatusCodes.InternalServerError)))
-
-          }
-
-        }
-
-      }
-
-      "for a scheduler that's been shut down" - {}
 
     }
 
-  }
+    "for a plan api compatible service" - {
 
+      trait PlanApiCompatibleConfiguredPlanApiClient {
+        val httpClient =
+          mockFunction[HttpRequest, String, Future[(HttpResponse, String)]]
+        val planApiClient = TestActorRef(
+          Props(classOf[PlanApiClient])
+            .withDispatcher(CallingThreadDispatcher.Id))
+
+        Await.result(planApiClient ? PlanApiClient.Configuration(httpClient, true),
+          timeout.duration)
+
+      }
+
+      trait PlansResponse
+        extends DefaultJsonProtocol
+          with PlanApiCompatibleConfiguredPlanApiClient {
+
+        import spray.json._
+
+        def plans = Array[String]("deploy")
+
+        val listPlansRequest = HttpRequest(method = HttpMethods.GET,
+          uri = "/service/andras-4/v1/plans")
+
+        httpClient expects(listPlansRequest, *) returning (Future.successful(
+          (HttpResponse(entity =
+            HttpEntity(ContentTypes.`application/json`, plans.toJson.toString)),
+            "")))
+
+      }
+
+      "on receiving a RetrievePlan message" - {
+
+        "for a compliant service api endpoint with a valid plan name" - {
+
+          val retrievePlan = PlanApiClient.RetrievePlan("andras-4", "deploy")
+
+          "it responds with Success(Plan)" in new PlansResponse with JsonSupport
+            with SprayJsonSupport {
+
+            val planResponse = Plan(
+              status = "COMPLETE",
+              errors = List(),
+              phases = List(
+                Phase(
+                  id = "ec3c6469-9c40-4e2b-8bc0-593c8c10c708",
+                  name = "node-deploy",
+                  status = "COMPLETE",
+                  steps = List(Step(
+                    id = "55ec5998-fb3d-4930-9b11-52ea69abaa53",
+                    name = "node-0:[server]",
+                    status = "COMPLETE",
+                    message = "com.mesosphere.sdk.scheduler.plan.DeploymentStep: 'node-0:[server] [55ec5998-fb3d-4930-9b11-52ea69abaa53]' has status: 'COMPLETE'."
+                  ))
+                ))
+            )
+
+            Await.result(Marshal(planResponse).to[ResponseEntity],
+              timeout.duration) match {
+              case re: ResponseEntity =>
+                val retrievePlanRequest =
+                  HttpRequest(method = HttpMethods.GET,
+                    uri = "/service/andras-4/v1/plans/deploy")
+                httpClient expects(retrievePlanRequest, *) returning (Future
+                  .successful((HttpResponse(entity = re), "")))
+
+                Await.result(planApiClient ? retrievePlan, timeout.duration) shouldEqual Success(
+                  planResponse)
+
+            }
+
+          }
+
+        }
+
+        "for a non-existant plan" - {
+
+          val retrievePlan = PlanApiClient.RetrievePlan("andras-4", "party")
+
+          "it responds with Failure(PlanNotFound)" in new PlansResponse
+            with JsonSupport with SprayJsonSupport {
+
+            Await.result(planApiClient ? retrievePlan, timeout.duration) shouldEqual Failure(
+              new PlanNotFound("andras-4", "party"))
+
+          }
+
+        }
+
+        "for a non-compliant service api" - {
+
+          val retrievePlan = PlanApiClient.RetrievePlan("andras-4", "deploy")
+
+          "in that plans can't be listed" - {
+
+            trait InvalidPlansResponse extends PlanApiCompatibleConfiguredPlanApiClient {
+
+              val listPlansRequest = HttpRequest(method = HttpMethods.GET,
+                uri =
+                  "/service/andras-4/v1/plans")
+
+              httpClient expects(listPlansRequest, *) returning (Future
+                .successful(
+                  (HttpResponse(status = StatusCodes.InternalServerError)),
+                  ""))
+
+            }
+
+            "it responds with Failure(UnexpectedResponse)" in new InvalidPlansResponse {
+
+              Await.result(planApiClient ? retrievePlan, timeout.duration) shouldEqual Failure(
+                new UnexpectedResponse(
+                  HttpResponse(status = StatusCodes.InternalServerError)))
+
+            }
+
+          }
+
+          "in that plan details can't be retrieved" - {
+
+            "it responds with Failure(UnexpectedResponse)" in new PlansResponse {
+
+              val retrievePlanRequest =
+                HttpRequest(method = HttpMethods.GET,
+                  uri = "/service/andras-4/v1/plans/deploy")
+              httpClient expects(retrievePlanRequest, *) returning (Future
+                .successful((HttpResponse(status = StatusCodes.InternalServerError), "")))
+
+              Await.result(planApiClient ? retrievePlan, timeout.duration) shouldEqual Failure(
+                new UnexpectedResponse(
+                  HttpResponse(status = StatusCodes.InternalServerError)))
+
+            }
+
+          }
+
+        }
+
+        "for a scheduler that's been shut down" - {}
+
+      }
+
+    }
+  }
 }

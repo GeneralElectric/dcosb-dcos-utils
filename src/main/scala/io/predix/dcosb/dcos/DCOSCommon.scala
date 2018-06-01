@@ -1,5 +1,7 @@
 package io.predix.dcosb.dcos
 
+import java.security.PrivateKey
+
 import spray.json.JsValue
 
 import scala.util.Try
@@ -26,7 +28,9 @@ object DCOSCommon {
   case class PkgInfo(pkgName: String, pkgVersion: String, planApiCompatible: Boolean)
 
   case class Connection(principal: Option[String],
-                        privateKey: Option[Array[Byte]],
+                        privateKeyStoreId: Option[String],
+                        privateKeyAlias: Option[String],
+                        privateKeyPassword: Option[String],
                         apiHost: String,
                         apiPort: Int)
 

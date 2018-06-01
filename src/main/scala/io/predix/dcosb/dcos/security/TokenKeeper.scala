@@ -1,21 +1,21 @@
 package io.predix.dcosb.dcos.security
 
-import java.security.{KeyFactory, PrivateKey}
+import java.io.ByteArrayInputStream
+import java.security.{KeyFactory, KeyStore, PrivateKey}
 import java.security.spec.PKCS8EncodedKeySpec
 import java.util.concurrent.TimeUnit
 
 import akka.actor.{Actor, ActorLogging, ActorRef, Stash}
 import akka.event.LoggingReceive
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
-import akka.http.scaladsl.model.headers.{
-  ModeledCustomHeader,
-  ModeledCustomHeaderCompanion
-}
+import akka.http.scaladsl.model.headers.{ModeledCustomHeader, ModeledCustomHeaderCompanion}
 import akka.http.scaladsl.model.{DateTime => _, _}
+import akka.http.scaladsl.unmarshalling.Unmarshal
 import io.predix.dcosb.config.model.DCOSClusterConnectionParameters
 import io.predix.dcosb.util.actor.ConfiguredActor
 import com.github.nscala_time.time.Imports._
 import akka.pattern._
+import akka.stream.{ActorMaterializer, ActorMaterializerSettings}
 import akka.util.Timeout
 import com.typesafe.config.ConfigFactory
 import io.predix.dcosb.dcos.{DCOSCommon, DCOSProxy}
@@ -30,7 +30,8 @@ import scala.util.{Failure, Success, Try}
 object TokenKeeper {
 
   case class Configuration(connection: DCOSCommon.Connection,
-                           httpClient: DCOSProxy.HttpClient)
+                           httpClient: DCOSProxy.HttpClient,
+                           aksm: ActorRef)
 
   case class Token(expiresAt: DateTime, token: String)
 
@@ -41,7 +42,16 @@ object TokenKeeper {
   // responses
   case class InvalidCredentials(principal: Option[String],
                                 privateKeyProvided: Boolean)
-      extends Throwable
+      extends Throwable {
+    override def toString: String = {
+      s"InvalidCredentials($principal, private key alias present: $privateKeyProvided)"
+    }
+  }
+  case class UnexpectedResponse(resp: HttpResponse) extends Throwable {
+    override def toString: String = {
+      super.toString + s", $resp"
+    }
+  }
 
   // misc
   final class DCOSAuthorizationTokenHeader(token: String)
@@ -89,6 +99,9 @@ object TokenKeeper {
       with SprayJsonSupport
       with DefaultJsonProtocol {
 
+    implicit val ec = context.dispatcher
+    implicit val mat = ActorMaterializer(ActorMaterializerSettings(context.system))
+
     // DC/OS API model
     case class TokenResponse(token: String)
 
@@ -99,20 +112,41 @@ object TokenKeeper {
 
     // misc state
     private var currentToken: Option[Token] = None
+    private var privateKey: Option[PrivateKey] = None
 
     override def configure(
         configuration: Configuration): Future[ConfiguredActor.Configured] = {
       log.debug(s"Configuring ${this} with $configuration")
+      import io.predix.dcosb.util.encryption.AkkaKeyStoreManager._
       // must have principal & privateKey set
-      (configuration.connection.principal, configuration.connection.privateKey) match {
-        case (None, None) => Future.failed(InvalidCredentials(None, false))
-        case (Some(principal: String), None) =>
+      (configuration.connection.principal, configuration.connection.privateKeyAlias, configuration.connection.privateKeyStoreId, configuration.connection.privateKeyPassword) match {
+        case (None, None, _, _) => Future.failed(InvalidCredentials(None, false))
+        case (Some(principal: String), None, _, _) =>
           Future.failed(InvalidCredentials(Some(principal), false))
-        case (None, Some(_: Array[Byte])) =>
+        case (None, Some(_: String), _, _) =>
           Future.failed(InvalidCredentials(None, true))
-        case (Some(principal: String), Some(privateKey: Array[Byte])) =>
+        case (Some(principal: String), Some(privateKeyAlias: String), privateKeyStoreId, privateKeyPassword) =>
           httpClient = Some(configuration.httpClient)
-          super.configure(configuration)
+          val promise = Promise[ConfiguredActor.Configured]
+          // ask key store manager for our privatekey
+          implicit val t = timeout
+          (configuration.aksm ? GetPrivateKey(privateKeyAlias, privateKeyPassword, privateKeyStoreId)) onComplete {
+
+            case Success(Success(pk: PrivateKey)) =>
+              privateKey = Some(pk)
+              promise.completeWith(super.configure(configuration))
+            case Success(Failure(e: Throwable)) =>
+              log.error(s"Failed to get dc/os principal's private key with alias $privateKeyAlias from aksm: $e")
+              promise.failure(e)
+            case Success(r) =>
+              log.error(s"Unexpected response from aksm while trying to get dc/os principal's private key: $r")
+              promise.failure(new ConfiguredActor.ActorConfigurationException {})
+            case Failure(e) =>
+              log.error(s"Exception while trying to get dc/os principal's private key from aksm: $e")
+              promise.failure(e)
+          }
+
+          promise.future
 
       }
 
@@ -124,7 +158,7 @@ object TokenKeeper {
       val promise = Promise[Token]()
 
       def retrieveToken(principal: String,
-                        privateKeyBytes: Array[Byte],
+                        privateKey: PrivateKey,
                         promise: Promise[Token]): Unit = {
 
         def `sendRequest, unmarshall and fulfill promise`(
@@ -132,17 +166,16 @@ object TokenKeeper {
             request: HttpRequest,
             promise: Promise[Token]): Unit = {
 
-          `sendRequest and unmarshall entity`[TokenResponse](
-            request,
-            (response: Try[TokenResponse]) => {
-              response match {
+          `sendRequest and handle response`(request, {
+            case Success(HttpResponse(StatusCodes.OK, _, re, _)) =>
+              Unmarshal(re).to[TokenResponse] onComplete {
                 case Success(tokenResponse: TokenResponse) =>
                   log.debug(s"Retrieved token from API: ${tokenResponse}")
                   // send a SetToken to TokenKeeper, fulfull promise once TokenKeeper confirms it
                   implicit val timeout: Timeout = Timeout(
                     FiniteDuration(1000, TimeUnit.MILLISECONDS)) // this should be a message to ourselves..
-                  val newToken =
-                    Token(DateTime.now + tokenExpiry, tokenResponse.token)
+                val newToken =
+                  Token(DateTime.now + tokenExpiry, tokenResponse.token)
                   (tokenKeeper ? SetToken(newToken)) onComplete {
                     case Success(Success(t: Token)) => promise.success(t)
                     case Success(Failure(e: Throwable)) =>
@@ -157,38 +190,41 @@ object TokenKeeper {
                   log.debug(s"Failed to retrieve token from API: $e")
                   promise.failure(e)
               }
-            }
-          )
+            case Success(r: HttpResponse) =>
+              r.entity.discardBytes()
+              promise.failure(new UnexpectedResponse(r))
+            case Failure(e: Throwable) =>
+              promise.failure(e)
+          })
 
         }
 
-        try {
-          val privateKey: PrivateKey = KeyFactory
-            .getInstance("RSA")
-            .generatePrivate(new PKCS8EncodedKeySpec(privateKeyBytes));
 
-          val loginToken = Jwt.encode(
-            s"""{"uid":"$principal"}""",
-            privateKey,
-            JwtAlgorithm.RS256)
 
-          log.debug(s"Created loginToken: $loginToken")
+          try {
+            val loginToken = Jwt.encode(
+              s"""{"uid":"$principal"}""",
+              privateKey,
+              JwtAlgorithm.RS256)
 
-          val tokenRequest = HttpRequest(
-            method = HttpMethods.POST,
-            uri = "/acs/api/v1/auth/login",
-            entity =
-              HttpEntity(ContentType(MediaTypes.`application/json`),
-                s"""{"uid":"$principal","token":"${loginToken}"}""")
-          )
+            log.debug(s"Created loginToken: $loginToken")
 
-          `sendRequest, unmarshall and fulfill promise`(context.self,
-            tokenRequest,
-            promise)
+            val tokenRequest = HttpRequest(
+              method = HttpMethods.POST,
+              uri = "/acs/api/v1/auth/login",
+              entity =
+                HttpEntity(ContentType(MediaTypes.`application/json`),
+                  s"""{"uid":"$principal","token":"${loginToken}"}""")
+            )
 
-        } catch {
-          case e: Throwable => promise.failure(e)
-        }
+            `sendRequest, unmarshall and fulfill promise`(context.self,
+              tokenRequest,
+              promise)
+
+          } catch {
+            case e: Throwable => promise.failure(e)
+          }
+
 
 
       }
@@ -201,10 +237,17 @@ object TokenKeeper {
             promise.success(t)
           case _ =>
             log.debug("No valid token was found, getting a new one")
-            // we know dcosClusterConnectionParameters are correctly set because of the check in configure() above
-            retrieveToken(configuration.connection.principal.get,
-                          configuration.connection.privateKey.get,
-                          promise)
+            privateKey match {
+              case Some(pk: PrivateKey) =>
+                // we know dcosClusterConnectionParameters are correctly set because of the check in configure() above
+                retrieveToken(configuration.connection.principal.get,
+                  pk,
+                  promise)
+              case None =>
+                log.error("No private key was available to sign token request..")
+                promise.failure(new ConfiguredActor.ActorConfigurationException {})
+
+            }
 
         }
 

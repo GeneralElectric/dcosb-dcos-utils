@@ -81,7 +81,10 @@ class DCOSProxyJsonSupportTest extends ActorSuite {
             "dcos-cosmos.service",
             0,
             "DC/OS Package Manager (Cosmos)",
-            DateTime.parse("2017-07-31T19:09:08.079629596Z").withChronology(ISOChronology.getInstance(DateTimeZone.getDefault())),
+            DateTime
+              .parse("2017-07-31T19:09:08.079629596Z")
+              .withChronology(
+                ISOChronology.getInstance(DateTimeZone.getDefault())),
             List(DCOSUnitNode(
               true,
               "master",
@@ -135,7 +138,10 @@ class DCOSProxyJsonSupportTest extends ActorSuite {
             "dcos-adminrouter-agent.service",
             0,
             "Admin Router Agent",
-            DateTime.parse("2017-07-31T19:09:08.181817995Z").withChronology(ISOChronology.getInstance(DateTimeZone.getDefault())),
+            DateTime
+              .parse("2017-07-31T19:09:08.181817995Z")
+              .withChronology(
+                ISOChronology.getInstance(DateTimeZone.getDefault())),
             List(
               DCOSUnitNode(
                 false,
@@ -210,7 +216,9 @@ class DCOSProxyJsonSupportTest extends ActorSuite {
             )
           )
         ),
-        DateTime.parse("2017-07-31T19:09:08.222594981Z").withChronology(ISOChronology.getInstance(DateTimeZone.getDefault()))
+        DateTime
+          .parse("2017-07-31T19:09:08.222594981Z")
+          .withChronology(ISOChronology.getInstance(DateTimeZone.getDefault()))
       )
 
     }
@@ -227,9 +235,15 @@ class DCOSProxyTest extends ActorSuite {
 
   trait DCOSProxyMocks {
 
+    val aksm = TestActorRef(Props(new Actor {
+      override def receive: Receive = {
+        case _ =>
+      }
+    }))
+
     val tokenKeeper = TestActorRef(Props(new Actor {
       override def receive: Receive = {
-        case TokenKeeper.Configuration(_, _) =>
+        case TokenKeeper.Configuration(_, _, _) =>
           sender() ! Success(ConfiguredActor.Configured())
       }
     }).withDispatcher(CallingThreadDispatcher.Id))
@@ -243,7 +257,7 @@ class DCOSProxyTest extends ActorSuite {
 
     val planApiClient = TestActorRef(Props(new Actor {
       override def receive: Receive = {
-        case PlanApiClient.Configuration(_) =>
+        case PlanApiClient.Configuration(_, _) =>
           sender() ! Success(ConfiguredActor.Configured())
       }
     }).withDispatcher(CallingThreadDispatcher.Id))
@@ -265,11 +279,13 @@ class DCOSProxyTest extends ActorSuite {
     val childMaker: (ActorRefFactory, Class[_ <: Actor], String) => ActorRef = {
       (factory, actorClass, name) =>
         actorClass match {
-          case c: Class[_] if c == classOf[TokenKeeper.JWTSigningTokenKeeper]     => tokenKeeper
+          case c: Class[_] if c == classOf[TokenKeeper.JWTSigningTokenKeeper] =>
+            tokenKeeper
           case c: Class[_] if c == classOf[CosmosApiClient] => cosmosApiClient
-          case c: Class[_] if c == classOf[PlanApiClient] => planApiClient
-          case c: Class[_] if c == classOf[MesosApiClient] => mesosApiClient
-          case c: Class[_] if c == classOf[MarathonApiClient] => marathonApiClient
+          case c: Class[_] if c == classOf[PlanApiClient]   => planApiClient
+          case c: Class[_] if c == classOf[MesosApiClient]  => mesosApiClient
+          case c: Class[_] if c == classOf[MarathonApiClient] =>
+            marathonApiClient
           case _ =>
             TestActorRef(Props(new Actor {
               override def receive: Receive = {
@@ -291,9 +307,10 @@ class DCOSProxyTest extends ActorSuite {
     }
 
     val connectionParameters =
-      DCOSCommon.Connection(None, None, "master.mesos", 80)
+      DCOSCommon.Connection(None, None, None, None, "master.mesos", 80)
     val connectionParametersVerifier =
       mockFunction[DCOSCommon.Connection, Future[DCOSCommon.Connection]]
+    val pkgInfo = DCOSCommon.PkgInfo("foo-pkg", "1.0.0", true)
 
     val dcosProxy = TestActorRef(
       Props(classOf[DCOSProxy]).withDispatcher(CallingThreadDispatcher.Id))
@@ -313,9 +330,11 @@ class DCOSProxyTest extends ActorSuite {
 
           Await.result(
             dcosProxy ? DCOSProxy.Configuration(childMaker,
+                                                aksm,
                                                 httpClientFactory,
                                                 connectionParameters,
-                                                connectionParametersVerifier),
+                                                connectionParametersVerifier,
+                                                pkgInfo),
             timeout.duration) shouldEqual Failure(
             DCOSProxy.InvalidConnectionParameters("nope"))
 
@@ -328,9 +347,11 @@ class DCOSProxyTest extends ActorSuite {
 
           Await.result(
             dcosProxy ? DCOSProxy.Configuration(childMaker,
+                                                aksm,
                                                 httpClientFactory,
                                                 connectionParameters,
-                                                connectionParametersVerifier),
+                                                connectionParametersVerifier,
+                                                pkgInfo),
             timeout.duration) shouldEqual Success(ConfiguredActor.Configured())
 
         }
@@ -350,9 +371,11 @@ class DCOSProxyTest extends ActorSuite {
 
         Await.result(
           dcosProxy ? DCOSProxy.Configuration(childMaker,
+                                              aksm,
                                               httpClientFactory,
                                               connectionParameters,
-                                              connectionParametersVerifier),
+                                              connectionParametersVerifier,
+                                              pkgInfo),
           timeout.duration)
 
       }
@@ -383,7 +406,10 @@ class DCOSProxyTest extends ActorSuite {
 
           "cosmos is down" - {
 
-            trait HealthReportWithCosmosDown extends ConfiguredDCOSProxyMocks with DCOSProxy.ApiModel.JsonSupport with SprayJsonSupport {
+            trait HealthReportWithCosmosDown
+                extends ConfiguredDCOSProxyMocks
+                with DCOSProxy.ApiModel.JsonSupport
+                with SprayJsonSupport {
               import DCOSProxy.ApiModel._
 
               val now = DateTime.now()
@@ -419,8 +445,7 @@ class DCOSProxyTest extends ActorSuite {
                       Some(healthReport)))
 
                 case Failure(e: Throwable) =>
-                  fail(
-                    "Could not encode HealthReport, is DCOSProxyJsonSupportTest passing?")
+                  fail("Could not encode HealthReport, is DCOSProxyJsonSupportTest passing?")
               }
 
             }
@@ -429,13 +454,16 @@ class DCOSProxyTest extends ActorSuite {
 
           "all critical services are healthy" - {
 
-            trait HealthReportWithCosmosUp extends ConfiguredDCOSProxyMocks with DCOSProxy.ApiModel.JsonSupport with SprayJsonSupport {
+            trait HealthReportWithCosmosUp
+                extends ConfiguredDCOSProxyMocks
+                with DCOSProxy.ApiModel.JsonSupport
+                with SprayJsonSupport {
               import DCOSProxy.ApiModel._
 
               val now = DateTime.now()
               val healthReportRequest =
                 HttpRequest(method = HttpMethods.GET,
-                  uri = "/system/health/v1/report")
+                            uri = "/system/health/v1/report")
               val healthReport = HealthReport(
                 Units = HashMap(
                   "dcos-cosmos.service" -> DCOSUnit(
@@ -458,24 +486,27 @@ class DCOSProxyTest extends ActorSuite {
                     .successful((HttpResponse(entity = re), ""))) once ()
 
                   Await.result(dcosProxy ? DCOSProxy.Heartbeat(),
-                    timeout.duration) shouldEqual Success(HeartbeatOK(now))
+                               timeout.duration) shouldEqual Success(
+                    HeartbeatOK(now))
 
                 case Failure(e: Throwable) =>
-                  fail(
-                    "Could not encode HealthReport, is DCOSProxyJsonSupportTest passing?")
+                  fail("Could not encode HealthReport, is DCOSProxyJsonSupportTest passing?")
               }
 
             }
 
             "non-critical services are unhealthy" - {
 
-              trait HealthReportWithNoncriticalServiceDown extends ConfiguredDCOSProxyMocks with DCOSProxy.ApiModel.JsonSupport with SprayJsonSupport {
+              trait HealthReportWithNoncriticalServiceDown
+                  extends ConfiguredDCOSProxyMocks
+                  with DCOSProxy.ApiModel.JsonSupport
+                  with SprayJsonSupport {
                 import DCOSProxy.ApiModel._
 
                 val now = DateTime.now()
                 val healthReportRequest =
                   HttpRequest(method = HttpMethods.GET,
-                    uri = "/system/health/v1/report")
+                              uri = "/system/health/v1/report")
                 val healthReport = HealthReport(
                   Units = HashMap(
                     "dcos-cosmos.service" -> DCOSUnit(
@@ -484,12 +515,14 @@ class DCOSProxyTest extends ActorSuite {
                       Health = 0,
                       PrettyName = "DC/OS Package Manager (Cosmos)",
                       Timestamp = now),
-                    "some-other.service" -> DCOSUnit(
-                      UnitName = "some-other.service",
-                      Nodes = List(),
-                      Health = 1,
-                      PrettyName = "Some failing service",
-                      Timestamp = now)),
+                    "some-other.service" -> DCOSUnit(UnitName =
+                                                       "some-other.service",
+                                                     Nodes = List(),
+                                                     Health = 1,
+                                                     PrettyName =
+                                                       "Some failing service",
+                                                     Timestamp = now)
+                  ),
                   UpdatedTime = now
                 )
 
@@ -504,11 +537,11 @@ class DCOSProxyTest extends ActorSuite {
                       .successful((HttpResponse(entity = re), ""))) once ()
 
                     Await.result(dcosProxy ? DCOSProxy.Heartbeat(),
-                      timeout.duration) shouldEqual Success(HeartbeatOK(now))
+                                 timeout.duration) shouldEqual Success(
+                      HeartbeatOK(now))
 
                   case Failure(e: Throwable) =>
-                    fail(
-                      "Could not encode HealthReport, is DCOSProxyJsonSupportTest passing?")
+                    fail("Could not encode HealthReport, is DCOSProxyJsonSupportTest passing?")
                 }
 
               }
@@ -516,8 +549,6 @@ class DCOSProxyTest extends ActorSuite {
             }
 
           }
-
-
 
         }
 

@@ -5,6 +5,8 @@ import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
 import akka.http.scaladsl.marshalling.Marshal
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.headers.Accept
+import akka.http.scaladsl.unmarshalling.Unmarshal
+import akka.stream.{ActorMaterializer, ActorMaterializerSettings}
 import io.predix.dcosb.dcos.DCOSCommon
 import io.predix.dcosb.dcos.security.TokenKeeper.DCOSAuthorizationTokenHeader
 import io.predix.dcosb.dcos.security.{TokenAuthenticatingActor, TokenKeeper}
@@ -135,6 +137,9 @@ class CosmosApiClient
 
   import CosmosApiClient._
 
+  implicit val ec = context.dispatcher
+  implicit val mat = ActorMaterializer(ActorMaterializerSettings(context.system))
+
   override def configure(
       configuration: Configuration): Future[ConfiguredActor.Configured] = {
     httpClient = Some(configuration.httpClient)
@@ -230,22 +235,28 @@ class CosmosApiClient
       case Success(re: RequestEntity) =>
         configured((configuration: CosmosApiClient.Configuration) => {
 
-          val handler
-            : (Try[CosmosApiClient.ApiModel.UpdateResponse] => Unit) = {
-            case Success(r: CosmosApiClient.ApiModel.UpdateResponse) =>
-              promise.success(PackageUpdated(appId, r.resolvedOptions))
-            case Failure(e: Throwable) => promise.failure(e)
-          }
+          val updateService = HttpRequest(
+            method = HttpMethods.POST,
+            uri = "/cosmos/service/update",
+            entity = re.withContentType(
+              ContentType(ApiModel.updateRequestMediaType))).withHeaders(
+            Accept(List(MediaRange(ApiModel.updateResponseMediaType))))
 
-          `sendRequest and unmarshall entity`(
-            HttpRequest(
-              method = HttpMethods.POST,
-              uri = "/cosmos/service/update",
-              entity = re.withContentType(
-                ContentType(ApiModel.updateRequestMediaType))).withHeaders(
-              Accept(List(MediaRange(ApiModel.updateResponseMediaType)))),
-            handler
-          )
+          `sendRequest and handle response`(updateService, {
+            case Success(HttpResponse(StatusCodes.OK, _, re, _)) =>
+              Unmarshal(re.withContentType(ContentTypes.`application/json`)).to[CosmosApiClient.ApiModel.UpdateResponse] onComplete {
+                case Success(r: CosmosApiClient.ApiModel.UpdateResponse) =>
+                  promise.success(PackageUpdated(appId, r.resolvedOptions))
+                case Failure(e: Throwable) =>
+                  re.discardBytes()
+                  promise.failure(e)
+              }
+            case Success(r: HttpResponse) =>
+              r.entity.discardBytes()
+              promise.failure(new UnexpectedResponse(r))
+            case Failure(e: Throwable) =>
+              promise.failure(e)
+          })
 
         })
 

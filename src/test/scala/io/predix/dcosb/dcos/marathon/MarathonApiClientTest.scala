@@ -91,6 +91,73 @@ class MarathonApiClientTest extends ActorSuite {
 
     }
 
+    "in response to a GetAppIds message" - {
+
+      val getAppIds = MarathonApiClient.GetAppIds("cassandra")
+      val getAppsRequest = HttpRequest(method = HttpMethods.GET,
+        uri = "/service/marathon/v2/apps/?id=cassandra")
+
+      "for an id substring that yields app objects" - new ConfiguredMarathonApiClient
+        with MarathonApiClient.APIModel.JsonSupport {
+        import MarathonApiClient.APIModel._
+
+        val appsResponse = AppsResponse(
+          apps = List(
+            App(id = "/andras/cassandra",
+              env = HashMap("envvar" -> "value"),
+              labels = HashMap("label" -> "labelvalue")),
+            App(id = "/some/other/cassandra",
+              env = HashMap("envvar" -> "value"),
+              labels = HashMap("label" -> "labelvalue"))
+
+          ))
+
+        "it returns matching app ids as a sequence of Strings" in {
+
+          Await.result(Marshal(appsResponse).to[ResponseEntity],
+                                 timeout.duration) match {
+            case re: ResponseEntity =>
+              httpClient expects(getAppsRequest, *) returning (Future
+                .successful((HttpResponse(status = StatusCodes.OK, entity = re),
+                  ""))) once()
+
+              Await.result(marathonApiClient ? getAppIds,
+                timeout.duration) shouldEqual Success(
+                List("/andras/cassandra", "/some/other/cassandra"))
+
+          }
+
+        }
+
+      }
+
+      "for an id substring that yields no app objects" - new ConfiguredMarathonApiClient
+        with MarathonApiClient.APIModel.JsonSupport {
+        import MarathonApiClient.APIModel._
+
+        val appsResponse = AppsResponse(apps = List())
+
+        "it returns an empty sequence of Strings" in {
+
+          Await.result(Marshal(appsResponse).to[ResponseEntity],
+            timeout.duration) match {
+            case re: ResponseEntity =>
+              httpClient expects(getAppsRequest, *) returning (Future
+                .successful((HttpResponse(status = StatusCodes.OK, entity = re),
+                  ""))) once()
+
+              Await.result(marathonApiClient ? getAppIds,
+                timeout.duration) shouldEqual Success(List())
+
+          }
+
+        }
+
+
+      }
+
+    }
+
   }
 
 }

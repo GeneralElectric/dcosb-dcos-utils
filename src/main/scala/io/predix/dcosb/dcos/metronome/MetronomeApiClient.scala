@@ -4,6 +4,8 @@ import akka.actor.{Actor, ActorLogging, ActorRef}
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
 import akka.http.scaladsl.marshalling.Marshal
 import akka.http.scaladsl.model.{DateTime => _, _}
+import akka.http.scaladsl.unmarshalling.Unmarshal
+import akka.stream.{ActorMaterializer, ActorMaterializerSettings}
 import io.predix.dcosb.dcos.security.{TokenAuthenticatingActor, TokenKeeper}
 import io.predix.dcosb.util.actor.ConfiguredActor
 import io.predix.dcosb.util.actor.ConfiguredActor.Configured
@@ -33,6 +35,13 @@ object MetronomeApiClient {
   case class InsufficientPermissions(error: MetronomeApiModel.Error) extends Throwable
   case class JobStarted(run: MetronomeApiModel.Run)
   case class JobScheduled(jobId: String, schedule: MetronomeApiModel.Schedule)
+
+  // exceptions
+  case class UnexpectedResponse(resp: HttpResponse) extends Throwable {
+    override def toString: String = {
+      super.toString + s", $resp"
+    }
+  }
 
   object MetronomeApiModel {
 
@@ -98,6 +107,11 @@ object MetronomeApiClient {
 
 class MetronomeApiClient extends ConfiguredActor[MetronomeApiClient.Configuration] with ActorLogging with HttpClientActor with MetronomeApiClient.MetronomeApiModel.JsonSupport {
 
+  import MetronomeApiClient._
+
+  implicit val ec = context.dispatcher
+  implicit val mat = ActorMaterializer(ActorMaterializerSettings(context.system))
+
   override def configure(configuration: MetronomeApiClient.Configuration): Future[Configured] = {
     this.httpClient = Some(configuration.httpClient)
 
@@ -114,12 +128,20 @@ class MetronomeApiClient extends ConfiguredActor[MetronomeApiClient.Configuratio
 
     def `sendRequest, unmarshall and fulfill promise`(request: HttpRequest, p: Promise[MetronomeApiClient.JobCreated]): Unit = {
 
-      `sendRequest and unmarshall entity`[MetronomeApiClient.MetronomeApiModel.Job](request, (response: Try[MetronomeApiClient.MetronomeApiModel.Job]) => {
-        response match {
-          case Success(job: MetronomeApiClient.MetronomeApiModel.Job) => p.success(MetronomeApiClient.JobCreated(job))
-          case Failure(e: Throwable) => p.failure(e)
-        }
-      }, StatusCodes.Created)
+      `sendRequest and handle response`(request, {
+        case Success(HttpResponse(StatusCodes.Created, _, re, _)) =>
+          Unmarshal(re).to[MetronomeApiClient.MetronomeApiModel.Job] onComplete {
+            case Success(job: MetronomeApiClient.MetronomeApiModel.Job) => p.success(MetronomeApiClient.JobCreated(job))
+            case Failure(e: Throwable) =>
+              re.discardBytes()
+              p.failure(e)
+          }
+        case Success(r: HttpResponse) =>
+          r.entity.discardBytes()
+          promise.failure(new UnexpectedResponse(r))
+        case Failure(e: Throwable) =>
+          promise.failure(e)
+      })
 
     }
 

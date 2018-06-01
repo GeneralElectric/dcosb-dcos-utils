@@ -1,12 +1,15 @@
 package io.predix.dcosb.dcos
 
 import java.net.InetSocketAddress
+import java.security.PrivateKey
 
 import akka.actor.{Actor, ActorRef, ActorRefFactory}
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
 import akka.http.scaladsl.model.headers.Accept
 import akka.pattern.ask
 import akka.http.scaladsl.model._
+import akka.http.scaladsl.unmarshalling.Unmarshal
+import akka.stream.{ActorMaterializer, ActorMaterializerSettings}
 import akka.util.Timeout
 import com.typesafe.config.ConfigFactory
 import io.predix.dcosb.dcos.DCOSProxy.ApiModel.HealthReport
@@ -49,9 +52,11 @@ object DCOSProxy {
 
   case class Configuration(
       childMaker: (ActorRefFactory, Class[_ <: Actor], String) => ActorRef,
+      aksm: ActorRef,
       httpClientFactory: HttpClientFactory,
       connection: DCOSCommon.Connection,
-      connectionVerifier: ConnectionParametersVerifier)
+      connectionVerifier: ConnectionParametersVerifier,
+      pkgInfo: DCOSCommon.PkgInfo)
 
   object Target extends Enumeration {
     val COSMOS = Value(CosmosApiClient.name)
@@ -168,6 +173,9 @@ class DCOSProxy
       .toOrThrow[FiniteDuration])
   val criticalUnits = tConf.getStringList("dcosb.dcos.proxy.critical-units")
 
+  implicit val ec = context.dispatcher
+  implicit val mat = ActorMaterializer(ActorMaterializerSettings(context.system))
+
   private var targets: mutable.HashMap[Target.Value, ActorRef] =
     mutable.HashMap()
 
@@ -227,7 +235,7 @@ class DCOSProxy
 
                     log.debug(s"Created PlanApiClient(${targets(Target.PLAN)})")
                     (targets(Target.PLAN) ? PlanApiClient
-                      .Configuration(h(c))) onComplete {
+                      .Configuration(h(c), configuration.pkgInfo.planApiCompatible)) onComplete {
                       case Success(Success(ConfiguredActor.Configured())) =>
                         log.debug(
                           s"Configured PlanApiClient(${targets(Target.PLAN)})")
@@ -309,7 +317,9 @@ class DCOSProxy
       f: (Either[Option[ActorRef], Throwable] => Unit)): Unit = {
     configuration.connection match {
       case DCOSCommon.Connection(Some(principal: String),
-                                 Some(privateKey: Array[Byte]),
+                                 _,
+                                 Some(privateKeyAlias: String),
+                                 _,
                                  _,
                                  _) =>
         val tokenKeeper = configuration.childMaker(
@@ -317,7 +327,7 @@ class DCOSProxy
           classOf[TokenKeeper.JWTSigningTokenKeeper],
           TokenKeeper.name)
         log.debug(s"Created TokenKeeper($tokenKeeper)")
-        (tokenKeeper ? TokenKeeper.Configuration(connection, httpClient)) onComplete {
+        (tokenKeeper ? TokenKeeper.Configuration(connection, httpClient, configuration.aksm)) onComplete {
           case Success(Success(ConfiguredActor.Configured())) =>
             log.debug(s"Configured TokenKeeper($tokenKeeper)")
             f(Left(Some(tokenKeeper)))
@@ -334,35 +344,40 @@ class DCOSProxy
 
     val promise = Promise[HeartbeatOK]()
 
-    val handler: (Try[DCOSProxy.ApiModel.HealthReport] => Unit) = {
+    val heartbeatRequest = HttpRequest(method = HttpMethods.GET, uri = "/system/health/v1/report")
 
-      case Success(r: DCOSProxy.ApiModel.HealthReport) =>
-        collectFailingUnits(r) match {
-          case failingUnits: List[String] if failingUnits.filter {
+    `sendRequest and handle response`(heartbeatRequest, {
+      case Success(HttpResponse(StatusCodes.OK, _, re, _)) =>
+        Unmarshal(re).to[DCOSProxy.ApiModel.HealthReport] onComplete {
+          case Success(r: DCOSProxy.ApiModel.HealthReport) =>
+            collectFailingUnits(r) match {
+              case failingUnits: List[String] if failingUnits.filter {
                 criticalUnits.contains(_)
               }.size > 0 =>
-            log.warning(
-              s"Critical units failing health check found: ${failingUnits.mkString(",")}")
-            promise.failure(ClusterUnavailable(
-              s"The following units failed health check: ${failingUnits.mkString(",")}",
-              None,
-              Some(r)))
-          case _ =>
-            log.debug(s"No failing critical units")
-            promise.success(HeartbeatOK(r.UpdatedTime))
+                log.warning(
+                  s"Critical units failing health check found: ${failingUnits.mkString(",")}")
+                promise.failure(ClusterUnavailable(
+                  s"The following units failed health check: ${failingUnits.mkString(",")}",
+                  None,
+                  Some(r)))
+              case _ =>
+                log.debug(s"No failing critical units")
+                promise.success(HeartbeatOK(r.UpdatedTime))
+            }
+
+          case Failure(e: Throwable) =>
+            log.error(s"Failed to send http request to cluster: $e")
+            re.discardBytes()
+            promise.failure(
+              ClusterUnavailable("Failed to send http request to cluster", Some(e)))
         }
 
+      case Success(r: HttpResponse) =>
+        r.entity.discardBytes()
+        promise.failure(new ClusterUnavailable(s"Unexpected response to heartbeat: $r", None))
       case Failure(e: Throwable) =>
-        log.error(s"Failed to send http request to cluster: $e")
-        promise.failure(
-          ClusterUnavailable("Failed to send http request to cluster", Some(e)))
-
-    }
-
-    `sendRequest and unmarshall entity`(
-      HttpRequest(method = HttpMethods.GET, uri = "/system/health/v1/report"),
-      handler
-    )
+        promise.failure(new ClusterUnavailable(s"Failed to send http request to cluster", Some(e)))
+    })
 
     promise.future
 
